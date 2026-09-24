@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 .env
+.DS_Store
+
+# Personal receipts and generated reports
+Reimbursements/
+Reports/
+*.pdf
+*_reimbursement_verification.*

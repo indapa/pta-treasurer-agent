@@ -27,7 +27,7 @@ The result is one of these statuses:
 | `MATH_MISMATCH` | The claimed amount is higher or lower than the receipts support. |
 | `UNITEMIZED_RECEIPT` | At least one receipt has no line items. |
 
-The report is printed to the terminal and can also be saved as a Markdown file.
+The report is printed to the terminal and can also be saved as a PDF file.
 
 ## Requirements
 
@@ -65,7 +65,7 @@ uv run --env-file .env pta-agent.py \
 |---|---|
 | `-f`, `--reimbursement_form` | The completed reimbursement form (PDF or image). Required. |
 | `-r`, `--supporting_receipts` | One or more receipt files (PDF, PNG, JPG, JPEG, or WEBP), space-separated. Required. |
-| `-o`, `--output` | Optional output prefix. The report is also written to `<prefix>_reimbursement_verification.md`, e.g. `Jane_Doe_reimbursement_verification.md`. |
+| `-o`, `--output` | Optional output prefix. The report is also written to `<prefix>_reimbursement_verification.pdf`, e.g. `Jane_Doe_reimbursement_verification.pdf`. |
 
 Example terminal output:
 

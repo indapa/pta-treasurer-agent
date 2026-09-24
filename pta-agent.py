@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from PIL import Image
+from fpdf import FPDF, FontFace, XPos, YPos
 from pdf2image import convert_from_path
 from pydantic import BaseModel, Field
 
@@ -244,56 +245,99 @@ def build_audit_graph():
 
 
 # ==========================================
-# 5. Markdown Report
+# 5. PDF Report
 # ==========================================
 
-def _md_cell(text) -> str:
-    """Escapes a value for use inside a Markdown table cell."""
-    return str(text).replace("|", "\\|").replace("\n", " ")
+STATUS_COLORS = {
+    AuditStatus.APPROVED: (22, 128, 60),
+    AuditStatus.MATH_MISMATCH: (190, 30, 45),
+    AuditStatus.UNITEMIZED: (200, 110, 0),
+    AuditStatus.FORM_EXTRACTION_ERROR: (190, 30, 45),
+}
+
+# fpdf2's built-in fonts only cover Latin-1, so map common typographic characters.
+_PDF_REPLACEMENTS = {
+    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"', "\u2022": "*", "\u2026": "...", "\u2122": "(TM)",
+}
 
 
-def render_markdown_report(report: AuditReport, form_path: str, receipt_paths: List[str]) -> str:
-    lines = [
-        "# PTA Reimbursement Verification Report",
-        "",
-        "| Field | Value |",
-        "|---|---|",
-        f"| Claimant | {_md_cell(report.claimant_name)} |",
-        f"| Category/Event | {_md_cell(report.category)} |",
-        f"| Status | **{report.status.value}** |",
-        f"| Claimed Amount | ${report.claimed_amount:.2f} |",
-        f"| Supported Amount | ${report.supported_amount:.2f} |",
-        f"| Variance | ${report.difference:.2f} |",
-        f"| Reimbursement Form | `{Path(form_path).name}` |",
-        "",
-        "## Extracted Receipt Breakdown",
-        "",
+def _pdf_text(text) -> str:
+    text = str(text if text is not None else "")
+    for char, replacement in _PDF_REPLACEMENTS.items():
+        text = text.replace(char, replacement)
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def write_pdf_report(report: AuditReport, form_path: str, receipt_paths: List[str], output_path: Path) -> None:
+    pdf = FPDF(format="Letter")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    def heading(text: str, size: int) -> None:
+        pdf.set_font("Helvetica", "B", size)
+        pdf.multi_cell(0, size * 0.5, _pdf_text(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2)
+
+    heading("PTA Reimbursement Verification Report", 18)
+
+    # Summary
+    pdf.set_font("Helvetica", size=11)
+    summary = [
+        ("Claimant", report.claimant_name),
+        ("Category/Event", report.category),
+        ("Status", report.status.value),
+        ("Claimed Amount", f"${report.claimed_amount:.2f}"),
+        ("Supported Amount", f"${report.supported_amount:.2f}"),
+        ("Variance", f"${report.difference:.2f}"),
+        ("Reimbursement Form", Path(form_path).name),
     ]
+    with pdf.table(col_widths=(45, 135), first_row_as_headings=False, line_height=7) as table:
+        for label, value in summary:
+            row = table.row()
+            row.cell(label, style=FontFace(emphasis="BOLD"))
+            if label == "Status":
+                row.cell(value, style=FontFace(emphasis="BOLD", color=STATUS_COLORS[report.status]))
+            else:
+                row.cell(_pdf_text(value))
+    pdf.ln(6)
 
+    # Receipts
+    heading("Extracted Receipt Breakdown", 14)
     for idx, (rec, path) in enumerate(zip(report.receipt_breakdown, receipt_paths), start=1):
-        lines += [
-            f"### {idx}. {_md_cell(rec.vendor_name)}",
-            "",
-            f"- **File:** `{Path(path).name}`",
-            f"- **Date:** {rec.receipt_date}",
-            f"- **Total:** ${rec.total_amount:.2f}",
-            "",
-            "| Item | Amount |",
-            "|---|---:|",
-        ]
-        for item in rec.items:
-            lines.append(f"| {_md_cell(item.description)} | ${item.amount:.2f} |")
+        # Start a new page rather than leave a receipt heading stranded at the bottom.
+        if pdf.will_page_break(40):
+            pdf.add_page()
+        heading(f"{idx}. {rec.vendor_name or 'Unknown Vendor'}", 12)
+        for label, value in (("File", Path(path).name), ("Date", rec.receipt_date or "Unknown"), ("Total", f"${rec.total_amount:.2f}")):
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.write(5, f"{label}: ")
+            pdf.set_font("Helvetica", size=10)
+            pdf.write(5, _pdf_text(value))
+            pdf.ln(5)
+        pdf.ln(2)
+
+        rows = [(item.description, f"${item.amount:.2f}") for item in rec.items]
         if rec.tax_amount > 0:
-            lines.append(f"| *Tax* | ${rec.tax_amount:.2f} |")
+            rows.append(("Tax", f"${rec.tax_amount:.2f}"))
         if rec.tip_amount > 0:
-            lines.append(f"| *Tip* | ${rec.tip_amount:.2f} |")
-        lines.append("")
+            rows.append(("Tip", f"${rec.tip_amount:.2f}"))
+        if rows:
+            with pdf.table(col_widths=(150, 30), text_align=("LEFT", "RIGHT"), line_height=6,
+                           headings_style=FontFace(emphasis="BOLD", fill_color=(230, 230, 230))) as table:
+                table.row(["Item", "Amount"])
+                for description, amount in rows:
+                    table.row([_pdf_text(description), amount])
+        pdf.ln(5)
 
-    lines += ["## Audit Notes & Warnings", ""]
-    lines += [f"- {note}" for note in report.discrepancy_notes]
-    lines.append("")
+    # Notes
+    heading("Audit Notes & Warnings", 14)
+    pdf.set_font("Helvetica", size=10)
+    for note in report.discrepancy_notes:
+        pdf.multi_cell(0, 5, _pdf_text(f"- {note}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
 
-    return "\n".join(lines)
+    pdf.output(str(output_path))
 
 
 # ==========================================
@@ -322,7 +366,7 @@ def main():
     parser.add_argument(
         "-o", "--output",
         type=str,
-        help="Output prefix; the report is also written to <prefix>_reimbursement_verification.md."
+        help="Output prefix; the report is also written to <prefix>_reimbursement_verification.pdf."
     )
 
     args = parser.parse_args()
@@ -372,12 +416,11 @@ def main():
         print("="*50 + "\n")
 
         if args.output:
-            output_path = Path(f"{args.output}_reimbursement_verification.md")
-            output_path.write_text(
-                render_markdown_report(report, args.reimbursement_form, args.supporting_receipts),
-                encoding="utf-8"
-            )
-            print(f"[+] Markdown report written to {output_path}\n")
+            # Accept "-o Name.pdf" / "-o Name.md" as the prefix "Name".
+            prefix = args.output.removesuffix(".pdf").removesuffix(".md")
+            output_path = Path(f"{prefix}_reimbursement_verification.pdf")
+            write_pdf_report(report, args.reimbursement_form, args.supporting_receipts, output_path)
+            print(f"[+] PDF report written to {output_path}\n")
 
     except Exception as e:
         print(f"\nExecution failed: {e}", file=sys.stderr)
