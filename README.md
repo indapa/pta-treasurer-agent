@@ -19,6 +19,35 @@ The agent is a small [LangGraph](https://github.com/langchain-ai/langgraph) work
    - flags receipts with no itemized line items
    - flags receipts whose items + tax + tip don't add up to the receipt's total
 
+```mermaid
+flowchart TD
+    form[/"Reimbursement form<br/>-f (PDF or image)"/]
+    receipts[/"Receipt files<br/>-r (PDF or image)"/]
+    gemini{{"Google Gemini<br/>structured output"}}
+
+    start([START]) --> process_form
+    form --> process_form
+    process_form["<b>process_form</b><br/>Extract claimant, category,<br/>claimed amount, notes"]
+    process_form --> process_receipts
+    receipts --> process_receipts
+    process_receipts["<b>process_receipts</b><br/>One call per receipt file:<br/>vendor, date, items, tax, tip, total"]
+    process_receipts --> audit_check
+    audit_check["<b>audit_check</b><br/>Plain arithmetic, no AI:<br/>sum totals, check itemization<br/>and each receipt's math"]
+
+    process_form -.-> gemini
+    process_receipts -.-> gemini
+
+    audit_check --> decision{"Receipts itemized<br/>and total = claim?"}
+    decision -->|yes| approved["APPROVED"]
+    decision -->|"a receipt has no items"| unitemized["UNITEMIZED_RECEIPT"]
+    decision -->|"totals differ"| mismatch["MATH_MISMATCH"]
+
+    approved --> finish([END])
+    unitemized --> finish
+    mismatch --> finish
+    finish --> report[/"Terminal report<br/>+ optional PDF (-o)"/]
+```
+
 The result is one of these statuses:
 
 | Status | Meaning |
