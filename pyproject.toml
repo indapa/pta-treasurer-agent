@@ -1,0 +1,14 @@
+[project]
+name = "pta-cash-verification-agent"
+version = "0.1.0"
+description = "Verify PTA bank deposits match the Cash Verification Form"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fpdf2>=2.8.8",
+    "langchain-google-genai>=4.4.0",
+    "langgraph>=1.2.12",
+    "pdf2image>=1.17.0",
+    "pillow>=12.1.1",
+    "pydantic>=2.13.5",
+]

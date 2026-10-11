@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# Deposit slips, cash forms, and generated reports
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*_cash_verification.*
