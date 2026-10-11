@@ -9,6 +9,30 @@ and checks that the amount deposited matches the amount counted on the form.
 
 The agent is a small [LangGraph](https://github.com/langchain-ai/langgraph) workflow with three steps:
 
+```mermaid
+flowchart TD
+    form[/"Cash Verification Form<br/>(PDF or image)"/] --> process_form
+    deposit[/"Deposit slip<br/>(PDF or image)"/] --> process_deposit
+
+    START([START]) --> process_form["<b>process_form</b><br/>Gemini extracts handwritten<br/>counts and totals"]
+    process_form --> process_deposit["<b>process_deposit</b><br/>Gemini extracts the<br/>deposit amount"]
+    process_deposit --> verify{"<b>verify</b><br/>Deterministic math checks<br/>(no AI)"}
+    verify --> END([END])
+
+    verify -. deposit ≠ grand total .-> mismatch["AMOUNT_MISMATCH"]
+    verify -. amounts match,<br/>form math wrong .-> matherr["FORM_MATH_ERROR"]
+    verify -. amounts match,<br/>form math correct .-> verified["VERIFIED"]
+
+    classDef ai fill:#e8f0fe,stroke:#4285f4
+    classDef ok fill:#e6f4ea,stroke:#16803c
+    classDef warn fill:#fef3e0,stroke:#c86e00
+    classDef bad fill:#fce8e6,stroke:#be1e2d
+    class process_form,process_deposit ai
+    class verified ok
+    class matherr warn
+    class mismatch bad
+```
+
 1. **Read the Cash Verification Form**: extracts the unit name, activity, and date,
    then the handwritten count for each coin and bill, the coins, currency and checks
    totals, the grand total, and how many signature lines are signed. The form's
