@@ -888,7 +888,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pta-cash-verification-agent"
+name = "pta-treasurer-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

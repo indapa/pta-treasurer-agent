@@ -1,7 +1,7 @@
 [project]
-name = "pta-cash-verification-agent"
+name = "pta-treasurer-agent"
 version = "0.1.0"
-description = "Verify PTA bank deposits match the Cash Verification Form"
+description = "AI agents for PTA treasurer tasks: audit reimbursement requests and verify cash deposits"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

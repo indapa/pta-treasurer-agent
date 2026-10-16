@@ -3,10 +3,16 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+.vscode/
 
-# Deposit slips, cash forms, and generated reports
+# Personal documents and generated reports: receipts, deposit slips,
+# cash verification forms, and the agents' PDF/Markdown output
+Reimbursements/
+Reports/
 *.pdf
 *.png
 *.jpg
 *.jpeg
+*.webp
+*_reimbursement_verification.*
 *_cash_verification.*
