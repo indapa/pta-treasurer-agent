@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PTA Cash Verification Agent (Powered by Gemini)
+PTA Cash Verification Agent (local Ollama vision model, or Gemini)
 Extracts the counted totals from a PTA Cash Verification Form and the deposited
 amount from the bank deposit slip/receipt, then verifies the two amounts agree.
 """
@@ -21,8 +21,15 @@ from pdf2image import convert_from_path
 from pydantic import BaseModel, Field
 
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 
+# LLM_PROVIDER selects "gemini" (default, needs GOOGLE_API_KEY) or "ollama" (local).
+# The --provider and --model command-line options override these.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b")
+# Local vision models slow down sharply on large images; cap the longest side.
+OLLAMA_MAX_IMAGE_SIDE = 1600
 GEMINI_MODEL = "gemini-3.8-flash"
 
 # Silence the google-genai AFC advisory triggered by langchain's internal calls.
@@ -86,6 +93,14 @@ class VerificationReport(BaseModel):
 # 2. File Conversion Utilities
 # ==========================================
 
+def _fit_for_model(img: Image.Image) -> Image.Image:
+    """Downscales large pages for local Ollama models; Gemini gets the full resolution."""
+    if LLM_PROVIDER == "ollama" and max(img.size) > OLLAMA_MAX_IMAGE_SIDE:
+        img = img.copy()
+        img.thumbnail((OLLAMA_MAX_IMAGE_SIDE, OLLAMA_MAX_IMAGE_SIDE), Image.LANCZOS)
+    return img
+
+
 def load_file_as_base64_images(file_path: str) -> List[str]:
     """
     Accepts a path to a PDF or an Image file (.png, .jpeg, .jpg, .webp).
@@ -101,13 +116,14 @@ def load_file_as_base64_images(file_path: str) -> List[str]:
     if ext == ".pdf":
         images = convert_from_path(file_path)
         for img in images:
+            img = _fit_for_model(img)
             buffered = io.BytesIO()
             img.save(buffered, format="PNG")
             base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
     elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
         with Image.open(file_path) as img:
             buffered = io.BytesIO()
-            img.convert("RGB").save(buffered, format="PNG")
+            _fit_for_model(img.convert("RGB")).save(buffered, format="PNG")
             base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
     else:
         raise ValueError(f"Unsupported file format '{ext}' for file {file_path}")
@@ -126,8 +142,36 @@ def _image_payload(prompt: str, file_path: str) -> list:
 
 
 # ==========================================
-# 3. Agent Graph State & Nodes (Gemini Powered)
+# 3. Agent Graph State & Nodes
 # ==========================================
+
+def active_model() -> str:
+    return GEMINI_MODEL if LLM_PROVIDER == "gemini" else OLLAMA_MODEL
+
+
+def make_structured_llm(schema: type[BaseModel]):
+    """Returns a vision LLM bound to a Pydantic output schema for the configured provider."""
+    if LLM_PROVIDER == "gemini":
+        return ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0).with_structured_output(schema)
+    # Ollama constrains decoding to the JSON schema; num_ctx leaves room for image tokens.
+    # Small local models skip optional fields, so every field is marked required here.
+    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.0, num_ctx=8192)
+    json_schema = _require_all_fields(schema.model_json_schema())
+    return llm.with_structured_output(json_schema, method="json_schema") | schema.model_validate
+
+
+def _require_all_fields(node):
+    """Marks every property of every object in a JSON schema as required."""
+    if isinstance(node, dict):
+        if node.get("type") == "object" and "properties" in node:
+            node["required"] = list(node["properties"])
+        for value in node.values():
+            _require_all_fields(value)
+    elif isinstance(node, list):
+        for value in node:
+            _require_all_fields(value)
+    return node
+
 
 class AgentState(BaseModel):
     form_path: str
@@ -138,25 +182,27 @@ class AgentState(BaseModel):
 
 
 def process_cash_form_node(state: AgentState) -> dict:
-    """Extracts the handwritten counts and totals from the Cash Verification Form using Gemini."""
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0)
-    structured_llm = llm.with_structured_output(CashVerificationForm)
+    """Extracts the handwritten counts and totals from the Cash Verification Form."""
+    structured_llm = make_structured_llm(CashVerificationForm)
 
     prompt = (
         "This is a PTA Cash Verification Form. Extract the HANDWRITTEN values only. "
         "The blank form has pre-printed '0.00' placeholders on many lines; ignore them and "
         "treat a line as empty unless a count or amount has been written in by hand. "
         "Ignore the 'START UP CASH' section at the top; extract only the counted section "
-        "below UNIT NAME / ACTIVITY (coins, currency, checks, and GRAND TOTAL)."
+        "below UNIT NAME / ACTIVITY (coins, currency, checks, and GRAND TOTAL). "
+        "Each coin/currency row has three columns: the PRINTED denomination, the handwritten "
+        "NUMBER of coins or bills (count), and the handwritten dollar AMOUNT. For example, '11' "
+        "written on the '$5' row with '55.00' gives denomination '$5', denomination_value 5.0, "
+        "count 11, amount 55.0. Only include rows where something is handwritten."
     )
     form = structured_llm.invoke([{"role": "user", "content": _image_payload(prompt, state.form_path)}])
     return {"form": form}
 
 
 def process_deposit_node(state: AgentState) -> dict:
-    """Extracts the deposited amount from the bank deposit slip or receipt using Gemini."""
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0)
-    structured_llm = llm.with_structured_output(DepositReceipt)
+    """Extracts the deposited amount from the bank deposit slip or receipt."""
+    structured_llm = make_structured_llm(DepositReceipt)
 
     prompt = (
         "This is a bank deposit slip or teller deposit receipt. Extract the institution, "
@@ -391,8 +437,9 @@ def write_pdf_report(report: VerificationReport, form_path: str, deposit_path: s
 # ==========================================
 
 def main():
+    global LLM_PROVIDER, OLLAMA_MODEL, GEMINI_MODEL
     parser = argparse.ArgumentParser(
-        description="PTA Cash Verification Agent (Gemini): Verify a bank deposit slip matches the Cash Verification Form."
+        description="PTA Cash Verification Agent: Verify a bank deposit slip matches the Cash Verification Form."
     )
 
     parser.add_argument(
@@ -415,13 +462,35 @@ def main():
         help="Output prefix; the report is also written to <prefix>_cash_deposit_slip_verification.pdf."
     )
 
+    parser.add_argument(
+        "-p", "--provider",
+        choices=["gemini", "ollama"],
+        default=LLM_PROVIDER if LLM_PROVIDER in ("ollama", "gemini") else None,
+        help="LLM provider: 'gemini' (needs GOOGLE_API_KEY) or 'ollama' (local). "
+             "Defaults to $LLM_PROVIDER, or 'gemini'."
+    )
+
+    parser.add_argument(
+        "-m", "--model",
+        type=str,
+        help=f"Model name for the chosen provider (defaults: ollama={OLLAMA_MODEL}, gemini={GEMINI_MODEL})."
+    )
+
     args = parser.parse_args()
 
-    if not os.environ.get("GOOGLE_API_KEY"):
+    if args.provider is None:
+        parser.error(f"LLM_PROVIDER must be 'ollama' or 'gemini', got '{LLM_PROVIDER}'.")
+
+    LLM_PROVIDER = args.provider
+    if args.model and LLM_PROVIDER == "gemini":
+        GEMINI_MODEL = args.model
+    elif args.model:
+        OLLAMA_MODEL = args.model
+    if LLM_PROVIDER == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
         print("Error: GOOGLE_API_KEY environment variable is not set.", file=sys.stderr)
         sys.exit(1)
 
-    print("\n[+] Initializing PTA Cash Verification Agent (Powered by Gemini)...")
+    print(f"\n[+] Initializing PTA Cash Verification Agent ({LLM_PROVIDER}: {active_model()})...")
     print(f"    Cash Verification Form: {args.cash_verification_form}")
     print(f"    Deposit Slip:           {args.deposit_slip}")
 

@@ -2,7 +2,7 @@
 
 A command-line tool that checks PTA cash deposits. It reads a completed
 California State PTA **Cash Verification Form** and the bank **deposit slip or
-receipt** (PDF scans or images), extracts the key details with Google Gemini,
+receipt** (PDF scans or images), extracts the key details with a vision LLM (Google Gemini by default, or a local Ollama model),
 and checks that the amount deposited matches the amount counted on the form.
 
 ## What it does
@@ -14,8 +14,8 @@ flowchart TD
     form[/"Cash Verification Form<br/>(PDF or image)"/] --> process_form
     deposit[/"Deposit slip<br/>(PDF or image)"/] --> process_deposit
 
-    START([START]) --> process_form["<b>process_form</b><br/>Gemini extracts handwritten<br/>counts and totals"]
-    process_form --> process_deposit["<b>process_deposit</b><br/>Gemini extracts the<br/>deposit amount"]
+    START([START]) --> process_form["<b>process_form</b><br/>LLM extracts handwritten<br/>counts and totals"]
+    process_form --> process_deposit["<b>process_deposit</b><br/>LLM extracts the<br/>deposit amount"]
     process_deposit --> verify{"<b>verify</b><br/>Deterministic math checks<br/>(no AI)"}
     verify --> END([END])
 
@@ -64,6 +64,7 @@ The report is printed to the terminal and can also be saved as a PDF file.
 - [Poppler](https://poppler.freedesktop.org/), used to convert PDFs to images
   (macOS: `brew install poppler`, Debian/Ubuntu: `apt install poppler-utils`)
 - A Google Gemini API key from [Google AI Studio](https://aistudio.google.com/)
+  (the default), **or** [Ollama](https://ollama.com/) with a vision model to run locally
 
 ## Setup
 
@@ -72,6 +73,8 @@ cd pta-cash-verification-agent
 uv sync
 ```
 
+### Option A: Use Google Gemini (default)
+
 Store your API key in a `.env` file in the project folder (it is already in
 `.gitignore`, so it won't be committed):
 
@@ -79,6 +82,21 @@ Store your API key in a `.env` file in the project folder (it is already in
 echo 'GOOGLE_API_KEY=your-key-here' > .env
 chmod 600 .env
 ```
+
+### Option B: Run locally with Ollama
+
+Pass `--provider ollama`. No API key is needed, and your scans never leave your
+machine, but small local models misread handwritten tables more often than Gemini.
+
+```bash
+brew install ollama          # or download the app from https://ollama.com/download
+ollama serve                 # not needed if the Ollama menu-bar app is running
+ollama pull qwen2.5vl:7b     # vision model, ~6 GB
+```
+
+Use a different model with `--model`, for example
+`uv run pta-cash-agent.py --provider ollama --model gemma3:12b ...`. The model must support
+images.
 
 ## Usage
 
@@ -89,11 +107,15 @@ uv run --env-file .env pta-cash-agent.py \
   -o 5th_grade_popsicle_sales_20261002
 ```
 
+To run locally instead, add `--provider ollama` (the `--env-file` is then optional).
+
 | Option | Description |
 |---|---|
 | `-f`, `--cash_verification_form` | The completed Cash Verification Form (PDF or image). Required. |
 | `-d`, `--deposit_slip` | The bank deposit slip or teller receipt (PDF, PNG, JPG, JPEG, or WEBP). Required. |
 | `-o`, `--output` | Optional output prefix. The report is also written to `<prefix>_cash_verification.pdf`. |
+| `-p`, `--provider` | `gemini` (default) or `ollama` (local). Overrides `LLM_PROVIDER`. |
+| `-m`, `--model` | Model for the chosen provider, e.g. `gemma3:12b` or `gemini-3.8-flash`. Overrides `OLLAMA_MODEL` / `GEMINI_MODEL`. |
 
 Example terminal output:
 
@@ -128,8 +150,12 @@ VERIFICATION NOTES & WARNINGS:
 
 ## Notes
 
-- **Model:** the Gemini model is set by `GEMINI_MODEL` near the top of `pta-cash-agent.py`.
-- **API limits:** each run makes two Gemini requests, one for the form and one
+- **Provider:** `--provider` (or `LLM_PROVIDER`) selects `gemini` (default) or `ollama`.
+- **Model:** the Ollama model comes from `OLLAMA_MODEL` (default `qwen2.5vl:7b`).
+  The Gemini model is set by `GEMINI_MODEL` near the top of `pta-cash-agent.py`.
+- **Local accuracy:** small local models misread handwriting more often than
+  Gemini. If the counts look wrong, try a larger vision model.
+- **API limits (Gemini):** each run makes two Gemini requests, one for the form and one
   for the deposit slip. If you hit `429 RESOURCE_EXHAUSTED` on the free tier, wait
   a minute and retry.
 - **Review the results:** the AI can misread handwriting. Check the extracted
