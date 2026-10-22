@@ -6,27 +6,21 @@ cross-validates claim math, and outputs an audit result.
 """
 
 import argparse
-import base64
-import io
-import logging
-import os
 import sys
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
-from PIL import Image
-from fpdf import FPDF, FontFace, XPos, YPos
-from pdf2image import convert_from_path
+from fpdf import FontFace
 from pydantic import BaseModel, Field
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph import StateGraph, END
 
-GEMINI_MODEL = "gemini-3.8-flash"
-
-# Silence the google-genai AFC advisory triggered by langchain's internal calls.
-logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+from pta_common import (
+    GREEN, ORANGE, RED, TABLE_HEADING_FILL,
+    describe_llm, image_payload, make_structured_llm, new_report_pdf,
+    pdf_heading, pdf_label_line, pdf_notes, pdf_text, require_api_key,
+)
 
 
 # ==========================================
@@ -73,40 +67,7 @@ class AuditReport(BaseModel):
 
 
 # ==========================================
-# 2. File Conversion Utilities
-# ==========================================
-
-def load_file_as_base64_images(file_path: str) -> List[str]:
-    """
-    Accepts a path to a PDF or an Image file (.png, .jpeg, .jpg, .webp).
-    Returns a list of base64-encoded PNG strings.
-    """
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    ext = path.suffix.lower()
-    base64_images = []
-
-    if ext == ".pdf":
-        images = convert_from_path(file_path)
-        for img in images:
-            buffered = io.BytesIO()
-            img.save(buffered, format="PNG")
-            base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-    elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
-        with Image.open(file_path) as img:
-            buffered = io.BytesIO()
-            img.convert("RGB").save(buffered, format="PNG")
-            base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-    else:
-        raise ValueError(f"Unsupported file format '{ext}' for file {file_path}")
-
-    return base64_images
-
-
-# ==========================================
-# 3. Agent Graph State & Nodes (Gemini Powered)
+# 2. Agent Graph State & Nodes
 # ==========================================
 
 class AgentState(BaseModel):
@@ -118,49 +79,29 @@ class AgentState(BaseModel):
 
 
 def process_claim_form_node(state: AgentState) -> dict:
-    """Extracts structured reimbursement claim information using Gemini."""
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0)
-    structured_llm = llm.with_structured_output(ReimbursementClaim)
+    """Extracts structured reimbursement claim information."""
+    structured_llm = make_structured_llm(ReimbursementClaim)
 
-    base64_images = load_file_as_base64_images(state.form_path)
-    
-    content_payload = [{"type": "text", "text": "Extract reimbursement claim form details."}]
-    for b64 in base64_images:
-        content_payload.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"}
-        })
-
-    claim_data = structured_llm.invoke([{"role": "user", "content": content_payload}])
+    payload = image_payload("Extract reimbursement claim form details.", state.form_path)
+    claim_data = structured_llm.invoke([{"role": "user", "content": payload}])
     return {"claim": claim_data}
 
 
 def process_receipts_node(state: AgentState) -> dict:
-    """Extracts itemized details from every submitted receipt using Gemini."""
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0)
-    structured_llm = llm.with_structured_output(ParsedReceipt)
+    """Extracts itemized details from every submitted receipt."""
+    structured_llm = make_structured_llm(ParsedReceipt)
     
     parsed_list = []
     
     for receipt_path in state.receipt_paths:
         # All pages of one file form a single receipt, so a total repeated on a
         # later page (e.g. a payment confirmation) is not counted twice.
-        base64_images = load_file_as_base64_images(receipt_path)
-        payload = [
-            {
-                "type": "text",
-                "text": (
-                    "These images are all pages of ONE receipt. Extract vendor name, date, "
-                    "itemized prices, tax, tip, and grand total for the receipt as a whole. "
-                    "Do not duplicate items or totals that repeat across pages."
-                )
-            }
-        ]
-        for b64 in base64_images:
-            payload.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"}
-            })
+        prompt = (
+            "These images are all pages of ONE receipt. Extract vendor name, date, "
+            "itemized prices, tax, tip, and grand total for the receipt as a whole. "
+            "Do not duplicate items or totals that repeat across pages."
+        )
+        payload = image_payload(prompt, receipt_path)
         receipt_obj = structured_llm.invoke([{"role": "user", "content": payload}])
         parsed_list.append(receipt_obj)
 
@@ -226,7 +167,7 @@ def audit_and_cross_check_node(state: AgentState) -> dict:
 
 
 # ==========================================
-# 4. Build LangGraph Workflow
+# 3. Build LangGraph Workflow
 # ==========================================
 
 def build_audit_graph():
@@ -245,41 +186,19 @@ def build_audit_graph():
 
 
 # ==========================================
-# 5. PDF Report
+# 4. PDF Report
 # ==========================================
 
 STATUS_COLORS = {
-    AuditStatus.APPROVED: (22, 128, 60),
-    AuditStatus.MATH_MISMATCH: (190, 30, 45),
-    AuditStatus.UNITEMIZED: (200, 110, 0),
-    AuditStatus.FORM_EXTRACTION_ERROR: (190, 30, 45),
+    AuditStatus.APPROVED: GREEN,
+    AuditStatus.MATH_MISMATCH: RED,
+    AuditStatus.UNITEMIZED: ORANGE,
+    AuditStatus.FORM_EXTRACTION_ERROR: RED,
 }
-
-# fpdf2's built-in fonts only cover Latin-1, so map common typographic characters.
-_PDF_REPLACEMENTS = {
-    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
-    "\u201c": '"', "\u201d": '"', "\u2022": "*", "\u2026": "...", "\u2122": "(TM)",
-}
-
-
-def _pdf_text(text) -> str:
-    text = str(text if text is not None else "")
-    for char, replacement in _PDF_REPLACEMENTS.items():
-        text = text.replace(char, replacement)
-    return text.encode("latin-1", "replace").decode("latin-1")
-
 
 def write_pdf_report(report: AuditReport, form_path: str, receipt_paths: List[str], output_path: Path) -> None:
-    pdf = FPDF(format="Letter")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    def heading(text: str, size: int) -> None:
-        pdf.set_font("Helvetica", "B", size)
-        pdf.multi_cell(0, size * 0.5, _pdf_text(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(2)
-
-    heading("PTA Reimbursement Verification Report", 18)
+    pdf = new_report_pdf()
+    pdf_heading(pdf, "PTA Reimbursement Verification Report", 18)
 
     # Summary
     pdf.set_font("Helvetica", size=11)
@@ -299,22 +218,18 @@ def write_pdf_report(report: AuditReport, form_path: str, receipt_paths: List[st
             if label == "Status":
                 row.cell(value, style=FontFace(emphasis="BOLD", color=STATUS_COLORS[report.status]))
             else:
-                row.cell(_pdf_text(value))
+                row.cell(pdf_text(value))
     pdf.ln(6)
 
     # Receipts
-    heading("Extracted Receipt Breakdown", 14)
+    pdf_heading(pdf, "Extracted Receipt Breakdown", 14)
     for idx, (rec, path) in enumerate(zip(report.receipt_breakdown, receipt_paths), start=1):
         # Start a new page rather than leave a receipt heading stranded at the bottom.
         if pdf.will_page_break(40):
             pdf.add_page()
-        heading(f"{idx}. {rec.vendor_name or 'Unknown Vendor'}", 12)
+        pdf_heading(pdf, f"{idx}. {rec.vendor_name or 'Unknown Vendor'}", 12)
         for label, value in (("File", Path(path).name), ("Date", rec.receipt_date or "Unknown"), ("Total", f"${rec.total_amount:.2f}")):
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.write(5, f"{label}: ")
-            pdf.set_font("Helvetica", size=10)
-            pdf.write(5, _pdf_text(value))
-            pdf.ln(5)
+            pdf_label_line(pdf, label, value)
         pdf.ln(2)
 
         rows = [(item.description, f"${item.amount:.2f}") for item in rec.items]
@@ -324,24 +239,20 @@ def write_pdf_report(report: AuditReport, form_path: str, receipt_paths: List[st
             rows.append(("Tip", f"${rec.tip_amount:.2f}"))
         if rows:
             with pdf.table(col_widths=(150, 30), text_align=("LEFT", "RIGHT"), line_height=6,
-                           headings_style=FontFace(emphasis="BOLD", fill_color=(230, 230, 230))) as table:
+                           headings_style=FontFace(emphasis="BOLD", fill_color=TABLE_HEADING_FILL)) as table:
                 table.row(["Item", "Amount"])
                 for description, amount in rows:
-                    table.row([_pdf_text(description), amount])
+                    table.row([pdf_text(description), amount])
         pdf.ln(5)
 
     # Notes
-    heading("Audit Notes & Warnings", 14)
-    pdf.set_font("Helvetica", size=10)
-    for note in report.discrepancy_notes:
-        pdf.multi_cell(0, 5, _pdf_text(f"- {note}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(1)
+    pdf_notes(pdf, "Audit Notes & Warnings", report.discrepancy_notes)
 
     pdf.output(str(output_path))
 
 
 # ==========================================
-# 6. CLI Entrypoint
+# 5. CLI Entrypoint
 # ==========================================
 
 def main():
@@ -371,11 +282,9 @@ def main():
 
     args = parser.parse_args()
 
-    if not os.environ.get("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY environment variable is not set.", file=sys.stderr)
-        sys.exit(1)
+    require_api_key()
 
-    print("\n[+] Initializing PTA Reimbursement Agent (Powered by Gemini)...")
+    print(f"\n[+] Initializing PTA Reimbursement Agent ({describe_llm()})...")
     print(f"    Reimbursement Form: {args.reimbursement_form}")
     print(f"    Supporting Receipts ({len(args.supporting_receipts)}): {', '.join(args.supporting_receipts)}")
     

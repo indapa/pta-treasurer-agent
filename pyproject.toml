@@ -1,7 +1,7 @@
 [project]
 name = "pta-treasurer-agent"
 version = "0.1.0"
-description = "AI agents for PTA treasurer tasks: audit reimbursement requests and verify cash deposits"
+description = "AI agents for PTA treasurer tasks: audit reimbursement requests, verify cash deposits, and prepare the quarterly financial review"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

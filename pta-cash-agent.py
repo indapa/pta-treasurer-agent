@@ -1,39 +1,27 @@
 #!/usr/bin/env python3
 """
-PTA Cash Verification Agent (local Ollama vision model, or Gemini)
+PTA Cash Verification Agent (Gemini, or a local Ollama vision model)
 Extracts the counted totals from a PTA Cash Verification Form and the deposited
 amount from the bank deposit slip/receipt, then verifies the two amounts agree.
 """
 
 import argparse
-import base64
-import io
-import logging
-import os
 import sys
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
-from PIL import Image
-from fpdf import FPDF, FontFace, XPos, YPos
-from pdf2image import convert_from_path
+from fpdf import FontFace
 from pydantic import BaseModel, Field
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_ollama import ChatOllama
 from langgraph.graph import StateGraph, END
 
-# LLM_PROVIDER selects "gemini" (default, needs GOOGLE_API_KEY) or "ollama" (local).
-# The --provider and --model command-line options override these.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b")
-# Local vision models slow down sharply on large images; cap the longest side.
-OLLAMA_MAX_IMAGE_SIDE = 1600
-GEMINI_MODEL = "gemini-3.8-flash"
-
-# Silence the google-genai AFC advisory triggered by langchain's internal calls.
-logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+from pta_common import (
+    GREEN, ORANGE, RED, TABLE_HEADING_FILL,
+    add_llm_arguments, configure_llm_from_args, describe_llm, image_payload,
+    make_structured_llm, new_report_pdf, pdf_heading, pdf_label_line, pdf_notes,
+    pdf_text, require_api_key,
+)
 
 
 # ==========================================
@@ -90,88 +78,8 @@ class VerificationReport(BaseModel):
 
 
 # ==========================================
-# 2. File Conversion Utilities
+# 2. Agent Graph State & Nodes
 # ==========================================
-
-def _fit_for_model(img: Image.Image) -> Image.Image:
-    """Downscales large pages for local Ollama models; Gemini gets the full resolution."""
-    if LLM_PROVIDER == "ollama" and max(img.size) > OLLAMA_MAX_IMAGE_SIDE:
-        img = img.copy()
-        img.thumbnail((OLLAMA_MAX_IMAGE_SIDE, OLLAMA_MAX_IMAGE_SIDE), Image.LANCZOS)
-    return img
-
-
-def load_file_as_base64_images(file_path: str) -> List[str]:
-    """
-    Accepts a path to a PDF or an Image file (.png, .jpeg, .jpg, .webp).
-    Returns a list of base64-encoded PNG strings.
-    """
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    ext = path.suffix.lower()
-    base64_images = []
-
-    if ext == ".pdf":
-        images = convert_from_path(file_path)
-        for img in images:
-            img = _fit_for_model(img)
-            buffered = io.BytesIO()
-            img.save(buffered, format="PNG")
-            base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-    elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
-        with Image.open(file_path) as img:
-            buffered = io.BytesIO()
-            _fit_for_model(img.convert("RGB")).save(buffered, format="PNG")
-            base64_images.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
-    else:
-        raise ValueError(f"Unsupported file format '{ext}' for file {file_path}")
-
-    return base64_images
-
-
-def _image_payload(prompt: str, file_path: str) -> list:
-    payload = [{"type": "text", "text": prompt}]
-    for b64 in load_file_as_base64_images(file_path):
-        payload.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{b64}"}
-        })
-    return payload
-
-
-# ==========================================
-# 3. Agent Graph State & Nodes
-# ==========================================
-
-def active_model() -> str:
-    return GEMINI_MODEL if LLM_PROVIDER == "gemini" else OLLAMA_MODEL
-
-
-def make_structured_llm(schema: type[BaseModel]):
-    """Returns a vision LLM bound to a Pydantic output schema for the configured provider."""
-    if LLM_PROVIDER == "gemini":
-        return ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.0).with_structured_output(schema)
-    # Ollama constrains decoding to the JSON schema; num_ctx leaves room for image tokens.
-    # Small local models skip optional fields, so every field is marked required here.
-    llm = ChatOllama(model=OLLAMA_MODEL, temperature=0.0, num_ctx=8192)
-    json_schema = _require_all_fields(schema.model_json_schema())
-    return llm.with_structured_output(json_schema, method="json_schema") | schema.model_validate
-
-
-def _require_all_fields(node):
-    """Marks every property of every object in a JSON schema as required."""
-    if isinstance(node, dict):
-        if node.get("type") == "object" and "properties" in node:
-            node["required"] = list(node["properties"])
-        for value in node.values():
-            _require_all_fields(value)
-    elif isinstance(node, list):
-        for value in node:
-            _require_all_fields(value)
-    return node
-
 
 class AgentState(BaseModel):
     form_path: str
@@ -196,7 +104,7 @@ def process_cash_form_node(state: AgentState) -> dict:
         "written on the '$5' row with '55.00' gives denomination '$5', denomination_value 5.0, "
         "count 11, amount 55.0. Only include rows where something is handwritten."
     )
-    form = structured_llm.invoke([{"role": "user", "content": _image_payload(prompt, state.form_path)}])
+    form = structured_llm.invoke([{"role": "user", "content": image_payload(prompt, state.form_path)}])
     return {"form": form}
 
 
@@ -210,7 +118,7 @@ def process_deposit_node(state: AgentState) -> dict:
         "account's new or available balance as the deposit amount. If the cash and check "
         "portions of the deposit are listed separately, extract those too."
     )
-    deposit = structured_llm.invoke([{"role": "user", "content": _image_payload(prompt, state.deposit_path)}])
+    deposit = structured_llm.invoke([{"role": "user", "content": image_payload(prompt, state.deposit_path)}])
     return {"deposit": deposit}
 
 
@@ -306,7 +214,7 @@ def verify_amounts_node(state: AgentState) -> dict:
 
 
 # ==========================================
-# 4. Build LangGraph Workflow
+# 3. Build LangGraph Workflow
 # ==========================================
 
 def build_verification_graph():
@@ -325,40 +233,18 @@ def build_verification_graph():
 
 
 # ==========================================
-# 5. PDF Report
+# 4. PDF Report
 # ==========================================
 
 STATUS_COLORS = {
-    VerificationStatus.VERIFIED: (22, 128, 60),
-    VerificationStatus.AMOUNT_MISMATCH: (190, 30, 45),
-    VerificationStatus.FORM_MATH_ERROR: (200, 110, 0),
+    VerificationStatus.VERIFIED: GREEN,
+    VerificationStatus.AMOUNT_MISMATCH: RED,
+    VerificationStatus.FORM_MATH_ERROR: ORANGE,
 }
-
-# fpdf2's built-in fonts only cover Latin-1, so map common typographic characters.
-_PDF_REPLACEMENTS = {
-    "—": "-", "–": "-", "‘": "'", "’": "'",
-    "“": '"', "”": '"', "•": "*", "…": "...", "™": "(TM)",
-}
-
-
-def _pdf_text(text) -> str:
-    text = str(text if text is not None else "")
-    for char, replacement in _PDF_REPLACEMENTS.items():
-        text = text.replace(char, replacement)
-    return text.encode("latin-1", "replace").decode("latin-1")
-
 
 def write_pdf_report(report: VerificationReport, form_path: str, deposit_path: str, output_path: Path) -> None:
-    pdf = FPDF(format="Letter")
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    def heading(text: str, size: int) -> None:
-        pdf.set_font("Helvetica", "B", size)
-        pdf.multi_cell(0, size * 0.5, _pdf_text(text), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(2)
-
-    heading("PTA Cash Deposit Verification Report", 18)
+    pdf = new_report_pdf()
+    pdf_heading(pdf, "PTA Cash Deposit Verification Report", 18)
 
     # Summary
     pdf.set_font("Helvetica", size=11)
@@ -381,11 +267,11 @@ def write_pdf_report(report: VerificationReport, form_path: str, deposit_path: s
             if label == "Status":
                 row.cell(value, style=FontFace(emphasis="BOLD", color=STATUS_COLORS[report.status]))
             else:
-                row.cell(_pdf_text(value))
+                row.cell(pdf_text(value))
     pdf.ln(6)
 
     # Form count
-    heading("Cash Verification Form Count", 14)
+    pdf_heading(pdf, "Cash Verification Form Count", 14)
     form = report.form
     rows = [(line.denomination, str(line.count), f"${line.amount:.2f}") for line in form.coin_lines + form.currency_lines]
     rows += [
@@ -395,14 +281,14 @@ def write_pdf_report(report: VerificationReport, form_path: str, deposit_path: s
         ("Grand Total", "", f"${form.grand_total:.2f}"),
     ]
     with pdf.table(col_widths=(90, 40, 50), text_align=("LEFT", "RIGHT", "RIGHT"), line_height=6,
-                   headings_style=FontFace(emphasis="BOLD", fill_color=(230, 230, 230))) as table:
+                   headings_style=FontFace(emphasis="BOLD", fill_color=TABLE_HEADING_FILL)) as table:
         table.row(["Denomination", "Count", "Amount"])
         for denomination, count, amount in rows:
-            table.row([_pdf_text(denomination), count, amount])
+            table.row([pdf_text(denomination), count, amount])
     pdf.ln(5)
 
     # Deposit
-    heading("Deposit Slip", 14)
+    pdf_heading(pdf, "Deposit Slip", 14)
     deposit = report.deposit
     deposit_rows = [
         ("Institution", deposit.institution or "Unknown"),
@@ -415,29 +301,20 @@ def write_pdf_report(report: VerificationReport, form_path: str, deposit_path: s
     if deposit.check_amount is not None:
         deposit_rows.append(("Checks", f"${deposit.check_amount:.2f}"))
     for label, value in deposit_rows:
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.write(5, f"{label}: ")
-        pdf.set_font("Helvetica", size=10)
-        pdf.write(5, _pdf_text(value))
-        pdf.ln(5)
+        pdf_label_line(pdf, label, value)
     pdf.ln(5)
 
     # Notes
-    heading("Verification Notes & Warnings", 14)
-    pdf.set_font("Helvetica", size=10)
-    for note in report.notes:
-        pdf.multi_cell(0, 5, _pdf_text(f"- {note}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(1)
+    pdf_notes(pdf, "Verification Notes & Warnings", report.notes)
 
     pdf.output(str(output_path))
 
 
 # ==========================================
-# 6. CLI Entrypoint
+# 5. CLI Entrypoint
 # ==========================================
 
 def main():
-    global LLM_PROVIDER, OLLAMA_MODEL, GEMINI_MODEL
     parser = argparse.ArgumentParser(
         description="PTA Cash Verification Agent: Verify a bank deposit slip matches the Cash Verification Form."
     )
@@ -462,35 +339,13 @@ def main():
         help="Output prefix; the report is also written to <prefix>_cash_deposit_slip_verification.pdf."
     )
 
-    parser.add_argument(
-        "-p", "--provider",
-        choices=["gemini", "ollama"],
-        default=LLM_PROVIDER if LLM_PROVIDER in ("ollama", "gemini") else None,
-        help="LLM provider: 'gemini' (needs GOOGLE_API_KEY) or 'ollama' (local). "
-             "Defaults to $LLM_PROVIDER, or 'gemini'."
-    )
-
-    parser.add_argument(
-        "-m", "--model",
-        type=str,
-        help=f"Model name for the chosen provider (defaults: ollama={OLLAMA_MODEL}, gemini={GEMINI_MODEL})."
-    )
+    add_llm_arguments(parser)
 
     args = parser.parse_args()
+    configure_llm_from_args(parser, args)
+    require_api_key()
 
-    if args.provider is None:
-        parser.error(f"LLM_PROVIDER must be 'ollama' or 'gemini', got '{LLM_PROVIDER}'.")
-
-    LLM_PROVIDER = args.provider
-    if args.model and LLM_PROVIDER == "gemini":
-        GEMINI_MODEL = args.model
-    elif args.model:
-        OLLAMA_MODEL = args.model
-    if LLM_PROVIDER == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
-        print("Error: GOOGLE_API_KEY environment variable is not set.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"\n[+] Initializing PTA Cash Verification Agent ({LLM_PROVIDER}: {active_model()})...")
+    print(f"\n[+] Initializing PTA Cash Verification Agent ({describe_llm()})...")
     print(f"    Cash Verification Form: {args.cash_verification_form}")
     print(f"    Deposit Slip:           {args.deposit_slip}")
 
